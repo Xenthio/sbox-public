@@ -49,6 +49,13 @@ public class DamageInfo
 	public TagSet Tags { get; set; } = new();
 
 	/// <summary>
+	/// Direction and magnitude of physics push this damage should apply. The damageable
+	/// decides how to consume it (e.g. impulse on its own body, velocity inherited by gibs).
+	/// Zero means no push. Mirrors Source SDK's CTakeDamageInfo::m_vecDamageForce.
+	/// </summary>
+	public Vector3 Force { get; set; }
+
+	/// <summary>
 	/// True if this is explosive damage
 	/// </summary>
 	[Obsolete( "Use Tags" )]

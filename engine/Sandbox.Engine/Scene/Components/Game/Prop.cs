@@ -134,6 +134,15 @@ public class Prop : Component, Component.ExecuteInEditor, Component.IDamageable
 	[Property] public Action OnPropBreak { get; set; }
 	[Property] public Action<DamageInfo> OnPropTakeDamage { get; set; }
 
+	/// <summary>
+	/// Fired right after gibs spawn from a break. Provides the damage that caused the break
+	/// (may be null for non-damage breaks like fade-out or manual destruction) and the gibs
+	/// that were spawned. Useful for systems that need to transfer state from prop to gibs
+	/// (decals, attached ropes, particles). Pair with <see cref="Gib.FindAtPoint"/> to locate
+	/// the specific gib that took a given world point.
+	/// </summary>
+	[Property] public Action<DamageInfo, List<Gib>> OnGibsCreated { get; set; }
+
 	[Property, Hide]
 	List<Component> ProceduralComponents { get; set; }
 
@@ -354,6 +363,27 @@ public class Prop : Component, Component.ExecuteInEditor, Component.IDamageable
 
 		if ( IsProxy ) return;
 
+		// Always apply the damage's physics push to our own body. Dead/unbreakable props
+		// (gibs, Health<=0 props) still need to react. If this hit breaks the prop, the
+		// impulse integrates on the body before destruction and gibs inherit it through
+		// the existing PreVelocity chain in CreateGibs.
+		var rb = Components.Get<Rigidbody>();
+		if ( rb.IsValid() && rb.PhysicsBody.IsValid() )
+		{
+			// Impact damage fires after the collision has already drained rb.Velocity to near
+			// zero. Restore from PreVelocity so gibs inherit the pre-collision motion.
+			if ( damage.Tags.Contains( "impact" ) )
+			{
+				rb.Velocity = rb.PreVelocity;
+				rb.AngularVelocity = rb.PreAngularVelocity;
+			}
+
+			if ( damage.Force.LengthSquared > 0.0f )
+			{
+				rb.PhysicsBody.ApplyImpulseAt( damage.Position, damage.Force * rb.PhysicsBody.Mass );
+			}
+		}
+
 		// The dead feel nothing
 		if ( Health <= 0.0f )
 			return;
@@ -362,7 +392,7 @@ public class Prop : Component, Component.ExecuteInEditor, Component.IDamageable
 		if ( IsExplosive && damage.Tags.Contains( "impact" ) )
 		{
 			Health = 0;
-			Kill();
+			Kill( damage );
 			return;
 		}
 
@@ -386,7 +416,7 @@ public class Prop : Component, Component.ExecuteInEditor, Component.IDamageable
 
 		if ( Health <= 0 )
 		{
-			Kill();
+			Kill( damage );
 			Health = 0;
 		}
 	}
@@ -428,19 +458,19 @@ public class Prop : Component, Component.ExecuteInEditor, Component.IDamageable
 		}
 	}
 
-	public void Kill()
+	public void Kill( DamageInfo damage = null )
 	{
-		OnBreak();
+		OnBreak( damage );
 		GameObject.Destroy();
 	}
 
-	void OnBreak()
+	void OnBreak( DamageInfo damage )
 	{
 		OnPropBreak?.Invoke();
 
 		PlayBreakSound();
 
-		NetworkCreateGibs();
+		NetworkCreateGibs( damage?.Force ?? Vector3.Zero );
 
 		CreateExplosion();
 	}
@@ -512,15 +542,18 @@ public class Prop : Component, Component.ExecuteInEditor, Component.IDamageable
 	/// Create the gibs for this prop breaking, over the network. This causes clients to spawn the gibs too.
 	/// </summary>
 	[Rpc.Broadcast( NetFlags.OwnerOnly )]
-	public void NetworkCreateGibs()
+	public void NetworkCreateGibs( Vector3 force )
 	{
-		CreateGibs();
+		CreateGibs( force );
 	}
 
 	/// <summary>
-	/// Create the gibs and return them.
+	/// Create the gibs and return them. Reads the prop's current Velocity so that any impulse
+	/// applied to the body this tick is already reflected. <paramref name="force"/> is added on
+	/// top as a guaranteed velocity contribution (covers cases where the native impulse is not
+	/// yet visible in rb.Velocity at the time of reading, e.g. explosions).
 	/// </summary>
-	public List<Gib> CreateGibs()
+	public List<Gib> CreateGibs( Vector3 force = default )
 	{
 		var gibs = new List<Gib>();
 
@@ -591,22 +624,26 @@ public class Prop : Component, Component.ExecuteInEditor, Component.IDamageable
 			}
 		}
 
-		// Transfer velocity from us to the gibs.
+		// Transfer the prop's current velocity into each gib. rb.Velocity is the live body
+		// velocity, reflecting any impulses that were immediately applied this tick.
+		// force is added on top as a guaranteed contribution - it covers the explosion case
+		// where RadiusDamage fires ApplyForceAt which may not yet be visible in rb.Velocity.
 		if ( rb.IsValid() )
 		{
+			var angVel = rb.AngularVelocity;
+			var linVel = rb.Velocity;
+
 			foreach ( var gib in gibs )
 			{
 				var phys = gib.Components.Get<Rigidbody>( true );
 				if ( !phys.IsValid() ) continue;
 
-				// Compute linear velocity at the gibs spawn point.
-				var velocity = rb.PreVelocity + Vector3.Cross( rb.PreAngularVelocity, phys.MassCenter - rb.MassCenter );
-
-				// Apply 50% energy loss.
+				var velocity = linVel + Vector3.Cross( angVel, phys.MassCenter - rb.MassCenter );
 				velocity *= 0.5f;
+				velocity += force;
 
 				phys.Velocity = velocity;
-				phys.AngularVelocity = rb.PreAngularVelocity;
+				phys.AngularVelocity = angVel;
 			}
 		}
 
@@ -618,6 +655,8 @@ public class Prop : Component, Component.ExecuteInEditor, Component.IDamageable
 				gib.Ignite();
 			}
 		}
+
+		OnGibsCreated?.Invoke( null, gibs );
 
 		return gibs;
 	}
